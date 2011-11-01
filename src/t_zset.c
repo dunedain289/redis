@@ -1101,6 +1101,7 @@ typedef struct {
     int type; /* Set, sorted set */
     int encoding;
     double weight;
+    double exponent;
 
     union {
         /* Set iterators. */
@@ -1423,6 +1424,7 @@ int zuiCompareByCardinality(const void *s1, const void *s2) {
 #define REDIS_AGGR_SUM 1
 #define REDIS_AGGR_MIN 2
 #define REDIS_AGGR_MAX 3
+#define REDIS_AGGR_MULT 4
 #define zunionInterDictValue(_e) (dictGetEntryVal(_e) == NULL ? 1.0 : *(double*)dictGetEntryVal(_e))
 
 inline static void zunionInterAggregate(double *target, double val, int aggregate) {
@@ -1436,6 +1438,12 @@ inline static void zunionInterAggregate(double *target, double val, int aggregat
         *target = val < *target ? val : *target;
     } else if (aggregate == REDIS_AGGR_MAX) {
         *target = val > *target ? val : *target;
+    } else if (aggregate == REDIS_AGGR_MULT) {
+        *target = *target * val;
+        /* The result of adding two doubles is NaN when one variable
+         * is +inf and the other is -inf. When these numbers are added,
+         * we maintain the convention of the result being 0.0. */
+        if (isnan(*target)) *target = 0.0;
     } else {
         /* safety net */
         redisPanic("Unknown ZUNION/INTER aggregate type");
@@ -1488,6 +1496,9 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
 
         /* Default all weights to 1. */
         src[i].weight = 1.0;
+
+        /* Default all exponents to 1. */
+        src[i].exponent = 1.0;
     }
 
     /* parse optional extra arguments */
@@ -1505,6 +1516,16 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
                         return;
                     }
                 }
+            } else if (remaining >= (setnum + 1) && !strcasecmp(c->argv[j]->ptr,"exponents")) {
+                j++; remaining--;
+                for (i = 0; i < setnum; i++, j++, remaining--) {
+                    if (getDoubleFromObjectOrReply(c,c->argv[j],&src[i].exponent,
+                            "exponent value is not a double") != REDIS_OK)
+                    {
+                        zfree(src);
+                        return;
+                    }
+                }
             } else if (remaining >= 2 && !strcasecmp(c->argv[j]->ptr,"aggregate")) {
                 j++; remaining--;
                 if (!strcasecmp(c->argv[j]->ptr,"sum")) {
@@ -1513,6 +1534,8 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
                     aggregate = REDIS_AGGR_MIN;
                 } else if (!strcasecmp(c->argv[j]->ptr,"max")) {
                     aggregate = REDIS_AGGR_MAX;
+                } else if (!strcasecmp(c->argv[j]->ptr,"mult")) {
+                    aggregate = REDIS_AGGR_MULT;
                 } else {
                     zfree(src);
                     addReply(c,shared.syntaxerr);
@@ -1546,14 +1569,15 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
             while (zuiNext(&src[0],&zval)) {
                 double score, value;
 
-                score = src[0].weight * zval.score;
+                score = src[0].weight * pow(zval.score, src[0].exponent);
                 for (j = 1; j < setnum; j++) {
                     /* It is not safe to access the zset we are
                      * iterating, so explicitly check for equal object. */
                     if (src[j].subject == src[0].subject) {
-                        value = zval.score*src[j].weight;
+                        value = pow(zval.score, src[j].exponent)*src[j].weight;
                         zunionInterAggregate(&score,value,aggregate);
                     } else if (zuiFind(&src[j],&zval,&value)) {
+                        value = pow(value, src[j].exponent);
                         value *= src[j].weight;
                         zunionInterAggregate(&score,value,aggregate);
                     } else {
@@ -1588,7 +1612,7 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
                     continue;
 
                 /* Initialize score */
-                score = src[i].weight * zval.score;
+                score = src[i].weight * pow(zval.score, src[i].exponent);
 
                 /* Because the inputs are sorted by size, it's only possible
                  * for sets at larger indices to hold this element. */
@@ -1596,9 +1620,10 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
                     /* It is not safe to access the zset we are
                      * iterating, so explicitly check for equal object. */
                     if(src[j].subject == src[i].subject) {
-                        value = zval.score*src[j].weight;
+                        value = pow(zval.score, src[j].exponent)*src[j].weight;
                         zunionInterAggregate(&score,value,aggregate);
                     } else if (zuiFind(&src[j],&zval,&value)) {
+                        value = pow(value, src[j].exponent);
                         value *= src[j].weight;
                         zunionInterAggregate(&score,value,aggregate);
                     }
